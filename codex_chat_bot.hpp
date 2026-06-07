@@ -288,6 +288,10 @@ inline void reset_interrupt_requested() {
     detail::interrupt_requested_flag = 0;
 }
 
+inline void request_interrupt() {
+    detail::interrupt_requested_flag = 1;
+}
+
 class InterruptGuard {
 public:
     InterruptGuard() : previous_handler_(std::signal(SIGINT, detail::handle_interrupt_signal)) {
@@ -348,10 +352,16 @@ private:
 };
 
 inline std::string read_line(const std::string& prompt) {
+    if (interrupt_requested() || !std::cin.good()) {
+        return {};
+    }
     std::cout << prompt;
     std::cout.flush();
     std::string value;
-    std::getline(std::cin, value);
+    if (!std::getline(std::cin, value)) {
+        request_interrupt();
+        return {};
+    }
     return detail::trim(value);
 }
 
@@ -364,6 +374,9 @@ inline std::string read_required_line(const std::string& prompt, const std::stri
 }
 
 inline std::string read_secret(const std::string& prompt) {
+    if (interrupt_requested() || !std::cin.good()) {
+        return {};
+    }
     std::cout << prompt;
     std::cout.flush();
 
@@ -372,19 +385,29 @@ inline std::string read_secret(const std::string& prompt) {
     DWORD old_mode = 0;
     if (input == INVALID_HANDLE_VALUE || !GetConsoleMode(input, &old_mode)) {
         std::string value;
-        std::getline(std::cin, value);
+        if (!std::getline(std::cin, value)) {
+            request_interrupt();
+            return {};
+        }
         return detail::trim(value);
     }
 
     DWORD new_mode = old_mode & ~ENABLE_ECHO_INPUT;
     if (!SetConsoleMode(input, new_mode)) {
         std::string value;
-        std::getline(std::cin, value);
+        if (!std::getline(std::cin, value)) {
+            request_interrupt();
+            return {};
+        }
         return detail::trim(value);
     }
 
     std::string value;
-    std::getline(std::cin, value);
+    if (!std::getline(std::cin, value)) {
+        SetConsoleMode(input, old_mode);
+        request_interrupt();
+        return {};
+    }
     SetConsoleMode(input, old_mode);
     std::cout << "\n";
     return detail::trim(value);
@@ -392,7 +415,10 @@ inline std::string read_secret(const std::string& prompt) {
     termios old_term{};
     if (tcgetattr(STDIN_FILENO, &old_term) != 0) {
         std::string value;
-        std::getline(std::cin, value);
+        if (!std::getline(std::cin, value)) {
+            request_interrupt();
+            return {};
+        }
         return detail::trim(value);
     }
 
@@ -400,18 +426,28 @@ inline std::string read_secret(const std::string& prompt) {
     new_term.c_lflag &= ~static_cast<tcflag_t>(ECHO);
     if (tcsetattr(STDIN_FILENO, TCSANOW, &new_term) != 0) {
         std::string value;
-        std::getline(std::cin, value);
+        if (!std::getline(std::cin, value)) {
+            request_interrupt();
+            return {};
+        }
         return detail::trim(value);
     }
 
     std::string value;
-    std::getline(std::cin, value);
+    if (!std::getline(std::cin, value)) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
+        request_interrupt();
+        return {};
+    }
     tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
     std::cout << "\n";
     return detail::trim(value);
 #else
     std::string value;
-    std::getline(std::cin, value);
+    if (!std::getline(std::cin, value)) {
+        request_interrupt();
+        return {};
+    }
     return detail::trim(value);
 #endif
 }
