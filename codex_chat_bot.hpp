@@ -1866,6 +1866,38 @@ public:
         save_bound_history();
     }
 
+    void insert_msg(Message message) {
+        if (message.role != "user" && message.role != "assistant") {
+            throw std::invalid_argument("insert_msg role must be user or assistant");
+        }
+        std::string clean_content = detail::trim(message.content);
+        if (clean_content.empty()) {
+            throw std::invalid_argument("insert_msg content cannot be empty");
+        }
+
+        message.content = std::move(clean_content);
+        if (message.username.has_value()) {
+            message.username = normalize_username(*message.username);
+        } else {
+            message.username = default_username_for_role(message.role);
+        }
+        messages_.push_back(std::move(message));
+        trim_history();
+        save_bound_history();
+    }
+
+    void insert_msg(
+        const std::string& role,
+        const std::string& content,
+        const std::string& username = std::string()
+    ) {
+        std::optional<std::string> clean_username;
+        if (!username.empty()) {
+            clean_username = username;
+        }
+        insert_msg(Message(role, content, clean_username));
+    }
+
     std::string ask(const std::string& message, const std::string& username = DEFAULT_USERNAME, const Json& extra_request_args = Json::object()) {
         return send(message, username, extra_request_args).text;
     }

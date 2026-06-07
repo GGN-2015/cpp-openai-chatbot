@@ -27,6 +27,10 @@ int main() {
 
     codex_chat_bot::ChatSession bot(config);
     bot.bind_history("chat-history.json");
+    bot.refresh_system_rules();
+
+    bot.insert_msg("user", "Previously, I asked about cats.");
+    bot.insert_msg("assistant", "Previously, I answered with a short cat fact.");
 
     std::cout << bot.ask("Hello!") << "\n";
 }
