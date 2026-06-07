@@ -36,6 +36,33 @@ int main() {
 }
 ```
 
+## Canceling a running request
+
+`ChatSession::cancel_current_request()` can be called from another thread to
+stop the current HTTP request quickly. With the default `CurlTransport`, this
+terminates the running `curl` process and the thread that called `ask()` or
+`send()` receives `codex_chat_bot::RequestCanceledError`.
+
+```cpp
+codex_chat_bot::ChatSession bot(config);
+
+std::thread worker([&] {
+    try {
+        std::cout << bot.ask("Write a long answer.") << "\n";
+    } catch (const codex_chat_bot::RequestCanceledError&) {
+        std::cout << "Request canceled.\n";
+    }
+});
+
+// This may run from a UI button, signal-handling helper thread, or timeout.
+bot.cancel_current_request();
+worker.join();
+```
+
+The cancellation method is thread-safe and non-blocking. It returns `true` when
+a cancel request was accepted, and `false` when there is no active request or
+the configured custom transport does not support cancellation.
+
 Compile with C++17 or newer:
 
 ```sh

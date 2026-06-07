@@ -9,6 +9,7 @@
 #include <cctype>
 #include <csignal>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <fstream>
@@ -17,6 +18,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -39,6 +41,10 @@
 #endif
 #include <windows.h>
 #elif CODEX_CHAT_BOT_HAS_TERMIOS
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
 #endif
@@ -73,6 +79,11 @@ public:
 class ResponseTextError : public ChatBotError {
 public:
     explicit ResponseTextError(const std::string& message) : ChatBotError(message) {}
+};
+
+class RequestCanceledError : public ChatBotError {
+public:
+    explicit RequestCanceledError(const std::string& message) : ChatBotError(message) {}
 };
 
 namespace detail {
@@ -277,6 +288,195 @@ public:
 private:
     std::filesystem::path path_;
 };
+
+#ifdef _WIN32
+class WindowsHandle {
+public:
+    WindowsHandle() = default;
+    explicit WindowsHandle(HANDLE handle) : handle_(handle) {}
+    WindowsHandle(const WindowsHandle&) = delete;
+    WindowsHandle& operator=(const WindowsHandle&) = delete;
+
+    WindowsHandle(WindowsHandle&& other) noexcept : handle_(other.release()) {}
+
+    WindowsHandle& operator=(WindowsHandle&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    ~WindowsHandle() {
+        reset();
+    }
+
+    HANDLE get() const {
+        return handle_;
+    }
+
+    bool valid() const {
+        return handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE;
+    }
+
+    HANDLE release() {
+        HANDLE handle = handle_;
+        handle_ = nullptr;
+        return handle;
+    }
+
+    void reset(HANDLE handle = nullptr) {
+        if (valid()) {
+            CloseHandle(handle_);
+        }
+        handle_ = handle;
+    }
+
+private:
+    HANDLE handle_ = nullptr;
+};
+
+inline std::string windows_error_message(DWORD code) {
+    LPSTR buffer = nullptr;
+    DWORD size = FormatMessageA(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr,
+        code,
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        reinterpret_cast<LPSTR>(&buffer),
+        0,
+        nullptr);
+
+    std::string message;
+    if (size > 0 && buffer != nullptr) {
+        message.assign(buffer, buffer + size);
+        LocalFree(buffer);
+        message = trim(std::move(message));
+    }
+    if (message.empty()) {
+        message = "Windows error " + std::to_string(static_cast<unsigned long>(code));
+    }
+    return message;
+}
+
+inline WindowsHandle open_windows_output_handle(const std::filesystem::path& path) {
+    SECURITY_ATTRIBUTES attributes;
+    attributes.nLength = sizeof(attributes);
+    attributes.lpSecurityDescriptor = nullptr;
+    attributes.bInheritHandle = TRUE;
+
+    HANDLE handle = CreateFileW(
+        path.wstring().c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        &attributes,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        throw std::runtime_error("could not open process output file: " + path_for_error(path) +
+                                 ": " + windows_error_message(GetLastError()));
+    }
+    return WindowsHandle(handle);
+}
+
+inline std::wstring windows_quote_argument(const std::wstring& value) {
+    if (value.empty()) {
+        return L"\"\"";
+    }
+
+    bool needs_quotes = false;
+    for (wchar_t ch : value) {
+        if (ch == L' ' || ch == L'\t' || ch == L'\n' || ch == L'\r' || ch == L'"') {
+            needs_quotes = true;
+            break;
+        }
+    }
+    if (!needs_quotes) {
+        return value;
+    }
+
+    std::wstring out = L"\"";
+    std::size_t backslashes = 0;
+    for (wchar_t ch : value) {
+        if (ch == L'\\') {
+            ++backslashes;
+        } else if (ch == L'"') {
+            out.append(backslashes * 2 + 1, L'\\');
+            out.push_back(ch);
+            backslashes = 0;
+        } else {
+            out.append(backslashes, L'\\');
+            backslashes = 0;
+            out.push_back(ch);
+        }
+    }
+    out.append(backslashes * 2, L'\\');
+    out.push_back(L'"');
+    return out;
+}
+#elif CODEX_CHAT_BOT_HAS_TERMIOS
+class PosixFd {
+public:
+    PosixFd() = default;
+    explicit PosixFd(int fd) : fd_(fd) {}
+    PosixFd(const PosixFd&) = delete;
+    PosixFd& operator=(const PosixFd&) = delete;
+
+    PosixFd(PosixFd&& other) noexcept : fd_(other.release()) {}
+
+    PosixFd& operator=(PosixFd&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    ~PosixFd() {
+        reset();
+    }
+
+    int get() const {
+        return fd_;
+    }
+
+    bool valid() const {
+        return fd_ >= 0;
+    }
+
+    int release() {
+        int fd = fd_;
+        fd_ = -1;
+        return fd;
+    }
+
+    void reset(int fd = -1) {
+        if (valid()) {
+            ::close(fd_);
+        }
+        fd_ = fd;
+    }
+
+private:
+    int fd_ = -1;
+};
+
+inline std::string errno_message(int code) {
+    const char* message = std::strerror(code);
+    if (message == nullptr || *message == '\0') {
+        return "errno " + std::to_string(code);
+    }
+    return message;
+}
+
+inline PosixFd open_posix_output_fd(const std::filesystem::path& path) {
+    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        throw std::runtime_error("could not open process output file: " + path_for_error(path) +
+                                 ": " + errno_message(errno));
+    }
+    return PosixFd(fd);
+}
+#endif
 
 }  // namespace detail
 
@@ -1389,6 +1589,10 @@ class Transport {
 public:
     virtual ~Transport() = default;
     virtual HttpResponse send(const HttpRequest& request) = 0;
+
+    virtual bool cancel_current_request() {
+        return false;
+    }
 };
 
 class FunctionTransport : public Transport {
@@ -1413,14 +1617,61 @@ class CurlTransport : public Transport {
 public:
     explicit CurlTransport(std::string curl_executable = "curl") : curl_executable_(std::move(curl_executable)) {}
 
+    CurlTransport(const CurlTransport& other) {
+        std::lock_guard<std::mutex> lock(other.active_mutex_);
+        curl_executable_ = other.curl_executable_;
+    }
+
+    CurlTransport& operator=(const CurlTransport& other) {
+        if (this == &other) {
+            return *this;
+        }
+
+        std::scoped_lock lock(active_mutex_, other.active_mutex_);
+        curl_executable_ = other.curl_executable_;
+        active_state_.reset();
+        return *this;
+    }
+
+    CurlTransport(CurlTransport&& other) {
+        std::lock_guard<std::mutex> lock(other.active_mutex_);
+        curl_executable_ = std::move(other.curl_executable_);
+    }
+
+    CurlTransport& operator=(CurlTransport&& other) {
+        if (this == &other) {
+            return *this;
+        }
+
+        std::scoped_lock lock(active_mutex_, other.active_mutex_);
+        curl_executable_ = std::move(other.curl_executable_);
+        active_state_.reset();
+        return *this;
+    }
+
     const std::string& curl_executable() const {
         return curl_executable_;
+    }
+
+    bool cancel_current_request() override {
+        std::shared_ptr<ProcessState> state;
+        {
+            std::lock_guard<std::mutex> lock(active_mutex_);
+            state = active_state_;
+        }
+        if (!state) {
+            return false;
+        }
+        return state->cancel();
     }
 
     HttpResponse send(const HttpRequest& request) override {
         if (request.method != "POST") {
             throw ChatBotError("CurlTransport currently supports only POST requests");
         }
+
+        auto state = std::make_shared<ProcessState>();
+        ActiveRequestScope active_request(*this, state);
 
         detail::TempFile request_file(detail::unique_temp_path("codex_chat_bot_request_", ".json"));
         detail::TempFile response_file(detail::unique_temp_path("codex_chat_bot_response_", ".json"));
@@ -1431,12 +1682,10 @@ public:
         detail::write_text_file(request_file.path(), request.body);
         detail::write_text_file(config_file.path(), build_curl_config(request, request_file.path(), response_file.path()));
 
-        std::string command = detail::shell_command_executable(curl_executable_) + " --config " +
-                              detail::shell_quote(config_file.path().string()) + " > " +
-                              detail::shell_quote(code_file.path().string()) + " 2> " +
-                              detail::shell_quote(error_file.path().string());
+        throw_if_canceled(state);
 
-        int result = std::system(command.c_str());
+        int result = run_curl_process(config_file.path(), code_file.path(), error_file.path(), state);
+        throw_if_canceled(state);
 
         HttpResponse response;
         response.body = read_if_exists(response_file.path());
@@ -1458,7 +1707,106 @@ public:
     }
 
 private:
+    class ProcessState {
+    public:
+        bool cancel() {
+            std::lock_guard<std::mutex> lock(mutex_);
+            cancel_requested_ = true;
+#ifdef _WIN32
+            if (process_ != nullptr) {
+                TerminateProcess(process_, kCanceledExitCode);
+                return true;
+            }
+#elif CODEX_CHAT_BOT_HAS_TERMIOS
+            if (pid_ > 0) {
+                ::kill(pid_, SIGTERM);
+                return true;
+            }
+#endif
+            return true;
+        }
+
+        bool canceled() const {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return cancel_requested_;
+        }
+
+#ifdef _WIN32
+        void mark_started(HANDLE process) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            process_ = process;
+            if (cancel_requested_ && process_ != nullptr) {
+                TerminateProcess(process_, kCanceledExitCode);
+            }
+        }
+
+        void mark_finished() {
+            std::lock_guard<std::mutex> lock(mutex_);
+            process_ = nullptr;
+        }
+#elif CODEX_CHAT_BOT_HAS_TERMIOS
+        void mark_started(pid_t pid) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pid_ = pid;
+            if (cancel_requested_ && pid_ > 0) {
+                ::kill(pid_, SIGTERM);
+            }
+        }
+
+        void mark_finished() {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pid_ = -1;
+        }
+#else
+        void mark_started() {}
+        void mark_finished() {}
+#endif
+
+    private:
+#ifdef _WIN32
+        static constexpr UINT kCanceledExitCode = 1223;
+#endif
+        mutable std::mutex mutex_;
+        bool cancel_requested_ = false;
+#ifdef _WIN32
+        HANDLE process_ = nullptr;
+#elif CODEX_CHAT_BOT_HAS_TERMIOS
+        pid_t pid_ = -1;
+#endif
+    };
+
+    class ActiveRequestScope {
+    public:
+        ActiveRequestScope(CurlTransport& transport, std::shared_ptr<ProcessState> state)
+            : transport_(transport), state_(std::move(state)) {
+            std::lock_guard<std::mutex> lock(transport_.active_mutex_);
+            transport_.active_state_ = state_;
+        }
+
+        ActiveRequestScope(const ActiveRequestScope&) = delete;
+        ActiveRequestScope& operator=(const ActiveRequestScope&) = delete;
+
+        ~ActiveRequestScope() {
+            std::lock_guard<std::mutex> lock(transport_.active_mutex_);
+            if (transport_.active_state_ == state_) {
+                transport_.active_state_.reset();
+            }
+        }
+
+    private:
+        CurlTransport& transport_;
+        std::shared_ptr<ProcessState> state_;
+    };
+
     std::string curl_executable_;
+    mutable std::mutex active_mutex_;
+    std::shared_ptr<ProcessState> active_state_;
+
+    static void throw_if_canceled(const std::shared_ptr<ProcessState>& state) {
+        if (state && state->canceled()) {
+            throw RequestCanceledError("chat completion request canceled");
+        }
+    }
 
     static std::string read_if_exists(const std::filesystem::path& path) {
         std::error_code error;
@@ -1495,6 +1843,160 @@ private:
         }
         return config.str();
     }
+
+#ifdef _WIN32
+    int run_curl_process(
+        const std::filesystem::path& config_file,
+        const std::filesystem::path& code_file,
+        const std::filesystem::path& error_file,
+        const std::shared_ptr<ProcessState>& state
+    ) const {
+        detail::WindowsHandle code_handle = detail::open_windows_output_handle(code_file);
+        detail::WindowsHandle error_handle = detail::open_windows_output_handle(error_file);
+        detail::WindowsHandle input_handle = open_windows_null_input_handle();
+
+        STARTUPINFOW startup;
+        std::memset(&startup, 0, sizeof(startup));
+        startup.cb = sizeof(startup);
+        startup.dwFlags = STARTF_USESTDHANDLES;
+        startup.hStdInput = input_handle.get();
+        startup.hStdOutput = code_handle.get();
+        startup.hStdError = error_handle.get();
+
+        PROCESS_INFORMATION process_info;
+        std::memset(&process_info, 0, sizeof(process_info));
+
+        std::wstring command_line = detail::windows_quote_argument(std::filesystem::path(curl_executable_).wstring()) +
+                                    L" --config " + detail::windows_quote_argument(config_file.wstring());
+        std::vector<wchar_t> mutable_command(command_line.begin(), command_line.end());
+        mutable_command.push_back(L'\0');
+
+        if (!CreateProcessW(
+                nullptr,
+                mutable_command.data(),
+                nullptr,
+                nullptr,
+                TRUE,
+                0,
+                nullptr,
+                nullptr,
+                &startup,
+                &process_info)) {
+            throw ChatBotError("could not launch curl: " + detail::windows_error_message(GetLastError()));
+        }
+
+        detail::WindowsHandle process_handle(process_info.hProcess);
+        detail::WindowsHandle thread_handle(process_info.hThread);
+        state->mark_started(process_handle.get());
+        WaitForSingleObject(process_handle.get(), INFINITE);
+
+        DWORD exit_code = 1;
+        if (!GetExitCodeProcess(process_handle.get(), &exit_code)) {
+            exit_code = 1;
+        }
+        state->mark_finished();
+        return static_cast<int>(exit_code);
+    }
+
+    static detail::WindowsHandle open_windows_null_input_handle() {
+        SECURITY_ATTRIBUTES attributes;
+        attributes.nLength = sizeof(attributes);
+        attributes.lpSecurityDescriptor = nullptr;
+        attributes.bInheritHandle = TRUE;
+
+        HANDLE handle = CreateFileW(
+            L"NUL",
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &attributes,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            throw std::runtime_error("could not open NUL for curl stdin: " +
+                                     detail::windows_error_message(GetLastError()));
+        }
+        return detail::WindowsHandle(handle);
+    }
+#elif CODEX_CHAT_BOT_HAS_TERMIOS
+    int run_curl_process(
+        const std::filesystem::path& config_file,
+        const std::filesystem::path& code_file,
+        const std::filesystem::path& error_file,
+        const std::shared_ptr<ProcessState>& state
+    ) const {
+        detail::PosixFd code_fd = detail::open_posix_output_fd(code_file);
+        detail::PosixFd error_fd = detail::open_posix_output_fd(error_file);
+        std::string executable = curl_executable_;
+        std::string config_path = config_file.string();
+
+        pid_t pid = ::fork();
+        if (pid < 0) {
+            throw ChatBotError("could not launch curl: " + detail::errno_message(errno));
+        }
+
+        if (pid == 0) {
+            if (::dup2(code_fd.get(), STDOUT_FILENO) < 0 || ::dup2(error_fd.get(), STDERR_FILENO) < 0) {
+                _exit(126);
+            }
+
+            code_fd.reset();
+            error_fd.reset();
+
+            char* const args[] = {
+                const_cast<char*>(executable.c_str()),
+                const_cast<char*>("--config"),
+                const_cast<char*>(config_path.c_str()),
+                nullptr,
+            };
+            ::execvp(args[0], args);
+
+            const char message[] = "could not execute curl\n";
+            ::write(STDERR_FILENO, message, sizeof(message) - 1);
+            _exit(127);
+        }
+
+        state->mark_started(pid);
+
+        int status = 0;
+        while (true) {
+            pid_t waited = ::waitpid(pid, &status, 0);
+            if (waited == pid) {
+                break;
+            }
+            if (waited < 0 && errno == EINTR) {
+                continue;
+            }
+            state->mark_finished();
+            throw ChatBotError("could not wait for curl: " + detail::errno_message(errno));
+        }
+
+        state->mark_finished();
+        if (WIFEXITED(status)) {
+            return WEXITSTATUS(status);
+        }
+        if (WIFSIGNALED(status)) {
+            return 128 + WTERMSIG(status);
+        }
+        return 1;
+    }
+#else
+    int run_curl_process(
+        const std::filesystem::path& config_file,
+        const std::filesystem::path& code_file,
+        const std::filesystem::path& error_file,
+        const std::shared_ptr<ProcessState>& state
+    ) const {
+        state->mark_started();
+        std::string command = detail::shell_command_executable(curl_executable_) + " --config " +
+                              detail::shell_quote(config_file.string()) + " > " +
+                              detail::shell_quote(code_file.string()) + " 2> " +
+                              detail::shell_quote(error_file.string());
+        int result = std::system(command.c_str());
+        state->mark_finished();
+        return result;
+    }
+#endif
 };
 
 struct ChatResponse {
@@ -1741,15 +2243,74 @@ public:
     ChatSession(ChatConfig config, FunctionTransport::Callback callback)
         : ChatSession(std::move(config), std::make_shared<FunctionTransport>(std::move(callback))) {}
 
+    ChatSession(const ChatSession& other)
+        : config_(other.config_),
+          transport_(other.current_transport()),
+          messages_(other.messages_),
+          history_path_(other.history_path_) {}
+
+    ChatSession& operator=(const ChatSession& other) {
+        if (this == &other) {
+            return *this;
+        }
+
+        std::shared_ptr<Transport> copied_transport = other.current_transport();
+        config_ = other.config_;
+        messages_ = other.messages_;
+        history_path_ = other.history_path_;
+        {
+            std::lock_guard<std::mutex> lock(transport_mutex_);
+            transport_ = std::move(copied_transport);
+        }
+        return *this;
+    }
+
+    ChatSession(ChatSession&& other)
+        : config_(std::move(other.config_)),
+          messages_(std::move(other.messages_)),
+          history_path_(std::move(other.history_path_)) {
+        std::lock_guard<std::mutex> lock(other.transport_mutex_);
+        transport_ = std::move(other.transport_);
+    }
+
+    ChatSession& operator=(ChatSession&& other) {
+        if (this == &other) {
+            return *this;
+        }
+
+        std::shared_ptr<Transport> moved_transport;
+        {
+            std::lock_guard<std::mutex> lock(other.transport_mutex_);
+            moved_transport = std::move(other.transport_);
+        }
+        config_ = std::move(other.config_);
+        messages_ = std::move(other.messages_);
+        history_path_ = std::move(other.history_path_);
+        {
+            std::lock_guard<std::mutex> lock(transport_mutex_);
+            transport_ = std::move(moved_transport);
+        }
+        return *this;
+    }
+
     const ChatConfig& config() const { return config_; }
     ChatConfig& config() { return config_; }
 
     void set_transport(std::shared_ptr<Transport> transport) {
+        std::lock_guard<std::mutex> lock(transport_mutex_);
         transport_ = std::move(transport);
     }
 
     void set_transport(FunctionTransport::Callback callback) {
-        transport_ = std::make_shared<FunctionTransport>(std::move(callback));
+        set_transport(std::make_shared<FunctionTransport>(std::move(callback)));
+    }
+
+    bool cancel_current_request() {
+        std::shared_ptr<Transport> transport = current_transport();
+        if (!transport) {
+            return false;
+        }
+        return transport->cancel_current_request();
     }
 
     const std::vector<Message>& messages() const {
@@ -1935,6 +2496,7 @@ public:
 private:
     ChatConfig config_;
     std::shared_ptr<Transport> transport_;
+    mutable std::mutex transport_mutex_;
     std::vector<Message> messages_;
     std::optional<std::filesystem::path> history_path_;
 
@@ -1948,6 +2510,7 @@ private:
     }
 
     void ensure_transport() {
+        std::lock_guard<std::mutex> lock(transport_mutex_);
         if (!transport_) {
             if (config_.api_key.empty()) {
                 throw MissingAPIKeyError("missing API key; set ChatConfig::api_key before sending a message");
@@ -1957,6 +2520,11 @@ private:
             }
             transport_ = std::make_shared<CurlTransport>(config_.curl_path);
         }
+    }
+
+    std::shared_ptr<Transport> current_transport() const {
+        std::lock_guard<std::mutex> lock(transport_mutex_);
+        return transport_;
     }
 
     std::pair<Json, std::string> create_response_until_text(const Json& extra_request_args) {
@@ -1993,7 +2561,12 @@ private:
         }
         request.body = request_payload(extra_request_args).dump();
 
-        HttpResponse response = transport_->send(request);
+        std::shared_ptr<Transport> transport = current_transport();
+        if (!transport) {
+            throw ChatBotError("missing HTTP transport");
+        }
+
+        HttpResponse response = transport->send(request);
         if (response.status_code == 0) {
             std::string message = "chat completion request failed";
             if (!response.error.empty()) {
