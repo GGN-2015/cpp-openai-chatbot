@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <cctype>
+#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
@@ -20,8 +21,27 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
+
+#ifndef CODEX_CHAT_BOT_HAS_TERMIOS
+#if defined(__unix__) || defined(__APPLE__)
+#define CODEX_CHAT_BOT_HAS_TERMIOS 1
+#else
+#define CODEX_CHAT_BOT_HAS_TERMIOS 0
+#endif
+#endif
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#elif CODEX_CHAT_BOT_HAS_TERMIOS
+#include <termios.h>
+#include <unistd.h>
+#endif
 
 namespace codex_chat_bot {
 
@@ -56,6 +76,12 @@ public:
 };
 
 namespace detail {
+
+inline volatile std::sig_atomic_t interrupt_requested_flag = 0;
+
+inline void handle_interrupt_signal(int) {
+    interrupt_requested_flag = 1;
+}
 
 inline std::string trim(std::string value) {
     auto not_space = [](unsigned char ch) { return !std::isspace(ch); };
@@ -253,6 +279,240 @@ private:
 };
 
 }  // namespace detail
+
+inline bool interrupt_requested() {
+    return detail::interrupt_requested_flag != 0;
+}
+
+inline void reset_interrupt_requested() {
+    detail::interrupt_requested_flag = 0;
+}
+
+class InterruptGuard {
+public:
+    InterruptGuard() : previous_handler_(std::signal(SIGINT, detail::handle_interrupt_signal)) {
+        reset_interrupt_requested();
+    }
+
+    InterruptGuard(const InterruptGuard&) = delete;
+    InterruptGuard& operator=(const InterruptGuard&) = delete;
+
+    ~InterruptGuard() {
+        if (previous_handler_ != SIG_ERR) {
+            std::signal(SIGINT, previous_handler_);
+        }
+    }
+
+    bool interrupted() const {
+        return interrupt_requested();
+    }
+
+private:
+    using SignalHandler = void (*)(int);
+
+    SignalHandler previous_handler_;
+};
+
+class ConsoleUtf8Guard {
+public:
+#ifdef _WIN32
+    ConsoleUtf8Guard()
+        : old_input_cp_(GetConsoleCP()),
+          old_output_cp_(GetConsoleOutputCP()),
+          changed_input_(SetConsoleCP(CP_UTF8) != 0),
+          changed_output_(SetConsoleOutputCP(CP_UTF8) != 0) {}
+
+    ~ConsoleUtf8Guard() {
+        if (changed_input_) {
+            SetConsoleCP(old_input_cp_);
+        }
+        if (changed_output_) {
+            SetConsoleOutputCP(old_output_cp_);
+        }
+    }
+#else
+    ConsoleUtf8Guard() = default;
+    ~ConsoleUtf8Guard() = default;
+#endif
+
+    ConsoleUtf8Guard(const ConsoleUtf8Guard&) = delete;
+    ConsoleUtf8Guard& operator=(const ConsoleUtf8Guard&) = delete;
+
+private:
+#ifdef _WIN32
+    UINT old_input_cp_;
+    UINT old_output_cp_;
+    bool changed_input_;
+    bool changed_output_;
+#endif
+};
+
+inline std::string read_line(const std::string& prompt) {
+    std::cout << prompt;
+    std::cout.flush();
+    std::string value;
+    std::getline(std::cin, value);
+    return detail::trim(value);
+}
+
+inline std::string read_required_line(const std::string& prompt, const std::string& retry_prompt) {
+    std::string value = read_line(prompt);
+    while (value.empty() && !interrupt_requested() && std::cin.good()) {
+        value = read_line(retry_prompt);
+    }
+    return value;
+}
+
+inline std::string read_secret(const std::string& prompt) {
+    std::cout << prompt;
+    std::cout.flush();
+
+#ifdef _WIN32
+    HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD old_mode = 0;
+    if (input == INVALID_HANDLE_VALUE || !GetConsoleMode(input, &old_mode)) {
+        std::string value;
+        std::getline(std::cin, value);
+        return detail::trim(value);
+    }
+
+    DWORD new_mode = old_mode & ~ENABLE_ECHO_INPUT;
+    if (!SetConsoleMode(input, new_mode)) {
+        std::string value;
+        std::getline(std::cin, value);
+        return detail::trim(value);
+    }
+
+    std::string value;
+    std::getline(std::cin, value);
+    SetConsoleMode(input, old_mode);
+    std::cout << "\n";
+    return detail::trim(value);
+#elif CODEX_CHAT_BOT_HAS_TERMIOS
+    termios old_term{};
+    if (tcgetattr(STDIN_FILENO, &old_term) != 0) {
+        std::string value;
+        std::getline(std::cin, value);
+        return detail::trim(value);
+    }
+
+    termios new_term = old_term;
+    new_term.c_lflag &= ~static_cast<tcflag_t>(ECHO);
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &new_term) != 0) {
+        std::string value;
+        std::getline(std::cin, value);
+        return detail::trim(value);
+    }
+
+    std::string value;
+    std::getline(std::cin, value);
+    tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
+    std::cout << "\n";
+    return detail::trim(value);
+#else
+    std::string value;
+    std::getline(std::cin, value);
+    return detail::trim(value);
+#endif
+}
+
+inline std::string read_required_secret(const std::string& prompt, const std::string& retry_prompt) {
+    std::string value = read_secret(prompt);
+    while (value.empty() && !interrupt_requested() && std::cin.good()) {
+        value = read_secret(retry_prompt);
+    }
+    return value;
+}
+
+inline std::string collapse_line_breaks(std::string value) {
+    std::string out;
+    out.reserve(value.size());
+
+    bool in_line_break = false;
+    for (char ch : value) {
+        if (ch == '\r' || ch == '\n') {
+            if (!in_line_break) {
+                out.push_back(' ');
+            }
+            in_line_break = true;
+            continue;
+        }
+        in_line_break = false;
+        out.push_back(ch);
+    }
+
+    return detail::trim(out);
+}
+
+inline std::string format_elapsed(std::chrono::seconds elapsed) {
+    const auto total_seconds = elapsed.count();
+    const auto minutes = total_seconds / 60;
+    const auto seconds = total_seconds % 60;
+
+    if (minutes <= 0) {
+        return std::to_string(seconds) + "s";
+    }
+    return std::to_string(minutes) + "m " + std::to_string(seconds) + "s";
+}
+
+class ThinkingStatus {
+public:
+    explicit ThinkingStatus(std::string prefix)
+        : prefix_(std::move(prefix)),
+          started_at_(std::chrono::steady_clock::now()),
+          running_(true),
+          max_width_(0),
+          worker_([this] { run(); }) {}
+
+    ThinkingStatus(const ThinkingStatus&) = delete;
+    ThinkingStatus& operator=(const ThinkingStatus&) = delete;
+
+    ~ThinkingStatus() {
+        stop();
+    }
+
+    void stop() {
+        bool expected = true;
+        if (!running_.compare_exchange_strong(expected, false)) {
+            return;
+        }
+
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+        clear_line();
+    }
+
+private:
+    std::string prefix_;
+    std::chrono::steady_clock::time_point started_at_;
+    std::atomic<bool> running_;
+    std::size_t max_width_;
+    std::thread worker_;
+
+    void run() {
+        while (running_.load()) {
+            render();
+            for (int i = 0; i < 10 && running_.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+    }
+
+    void render() {
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - started_at_);
+        const std::string text = prefix_ + " " + format_elapsed(elapsed);
+        max_width_ = std::max(max_width_, text.size());
+        std::cout << '\r' << text << std::string(max_width_ - text.size(), ' ');
+        std::cout.flush();
+    }
+
+    void clear_line() {
+        std::cout << '\r' << std::string(max_width_, ' ') << '\r';
+        std::cout.flush();
+    }
+};
 
 class Json {
 public:
@@ -922,11 +1182,16 @@ struct ChatConfig {
     std::optional<double> timeout = DEFAULT_TIMEOUT_SECONDS;
     std::string organization;
     std::string project;
+    std::string curl_path = "curl";
 
     void normalize() {
         system_rules = normalize_system_rules(system_rules);
         if (model.empty()) {
             model = DEFAULT_MODEL;
+        }
+        curl_path = detail::trim(std::move(curl_path));
+        if (curl_path.empty()) {
+            curl_path = "curl";
         }
     }
 
@@ -958,6 +1223,10 @@ struct ChatConfig {
                 }
                 if (key == "timeout") {
                     config.timeout.reset();
+                    continue;
+                }
+                if (key == "curl_path") {
+                    config.curl_path.clear();
                     continue;
                 }
                 continue;
@@ -1017,6 +1286,11 @@ struct ChatConfig {
                     throw std::runtime_error("config file project must be a string");
                 }
                 config.project = value.as_string();
+            } else if (key == "curl_path") {
+                if (!value.is_string()) {
+                    throw std::runtime_error("config file curl_path must be a string");
+                }
+                config.curl_path = value.as_string();
             } else {
                 throw std::runtime_error("config file has unsupported key: " + key);
             }
@@ -1102,6 +1376,10 @@ private:
 class CurlTransport : public Transport {
 public:
     explicit CurlTransport(std::string curl_executable = "curl") : curl_executable_(std::move(curl_executable)) {}
+
+    const std::string& curl_executable() const {
+        return curl_executable_;
+    }
 
     HttpResponse send(const HttpRequest& request) override {
         if (request.method != "POST") {
@@ -1519,10 +1797,24 @@ public:
 
     void reset(std::optional<std::vector<std::string>> system_rules = std::nullopt) {
         messages_.clear();
-        std::string system_content = build_system_content(system_rules);
-        if (!system_content.empty()) {
-            messages_.emplace_back("system", system_content, std::string(SYSTEM_USERNAME));
+        append_system_message(messages_, system_rules);
+        save_bound_history();
+    }
+
+    void refresh_system_rules(std::optional<std::vector<std::string>> system_rules = std::nullopt) {
+        std::vector<Message> updated;
+        append_system_message(updated, system_rules);
+
+        std::size_t first_non_system = 0;
+        while (first_non_system < messages_.size() && messages_[first_non_system].role == "system") {
+            ++first_non_system;
         }
+
+        updated.insert(updated.end(),
+                       messages_.begin() + static_cast<std::ptrdiff_t>(first_non_system),
+                       messages_.end());
+        messages_ = std::move(updated);
+        trim_history();
         save_bound_history();
     }
 
@@ -1595,7 +1887,7 @@ private:
             if (config_.base_url.empty()) {
                 throw MissingBaseURLError("missing API base URL; set ChatConfig::base_url before sending a message");
             }
-            transport_ = std::make_shared<CurlTransport>();
+            transport_ = std::make_shared<CurlTransport>(config_.curl_path);
         }
     }
 
@@ -1678,11 +1970,38 @@ private:
         return payload;
     }
 
-    std::string build_system_content(const std::optional<std::vector<std::string>>& system_rules) const {
+    std::vector<std::string> build_system_rules(const std::optional<std::vector<std::string>>& system_rules) const {
         if (system_rules.has_value()) {
-            return detail::join_with_space(normalize_system_rules(*system_rules));
+            return normalize_system_rules(*system_rules);
         }
-        return detail::join_with_space(config_.system_rules);
+        return normalize_system_rules(config_.system_rules);
+    }
+
+    std::string build_system_content(const std::optional<std::vector<std::string>>& system_rules) const {
+        std::vector<std::string> rules = build_system_rules(system_rules);
+        if (rules.empty()) {
+            return {};
+        }
+        if (rules.size() == 1) {
+            return rules.front();
+        }
+
+        std::ostringstream out;
+        out << "Follow all of these system rules. Later rules are equally important and must not be ignored:\n";
+        for (std::size_t i = 0; i < rules.size(); ++i) {
+            out << (i + 1) << ". " << rules[i];
+            if (i + 1 < rules.size()) {
+                out << '\n';
+            }
+        }
+        return out.str();
+    }
+
+    void append_system_message(std::vector<Message>& target, const std::optional<std::vector<std::string>>& system_rules) const {
+        std::string system_content = build_system_content(system_rules);
+        if (!system_content.empty()) {
+            target.emplace_back("system", std::move(system_content), std::string(SYSTEM_USERNAME));
+        }
     }
 
     void trim_history() {

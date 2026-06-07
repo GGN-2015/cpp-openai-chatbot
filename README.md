@@ -22,6 +22,7 @@ int main() {
     config.api_key = "YOUR_API_KEY";
     config.base_url = "https://api.openai.com/v1";
     config.model = "gpt-5.5";
+    config.curl_path = "curl"; // Or an absolute path to curl/curl.exe.
     config.system_rules = {"You are a helpful assistant."};
 
     codex_chat_bot::ChatSession bot(config);
@@ -58,5 +59,7 @@ aarch64-linux-gnu-g++ -std=c++17 -pthread -I. sample.cpp -o sample-aarch64
 arm-linux-gnueabihf-g++ -std=c++17 -pthread -I. sample.cpp -o sample-armhf
 ```
 
-The target device still needs a working `curl` executable on `PATH` at runtime,
-because the default HTTPS transport launches `curl`.
+The target device still needs a working `curl` executable at runtime, because
+the default HTTPS transport launches `curl`. If it is not on `PATH`, set
+`ChatConfig::curl_path` to the absolute executable path before creating the
+`ChatSession`.
