@@ -9,12 +9,18 @@
 #include <thread>
 #include <utility>
 
+#if defined(__unix__) || defined(__APPLE__)
+#define CODEX_CHAT_BOT_HAS_TERMIOS 1
+#else
+#define CODEX_CHAT_BOT_HAS_TERMIOS 0
+#endif
+
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
-#elif defined(__unix__) || defined(__APPLE__)
+#elif CODEX_CHAT_BOT_HAS_TERMIOS
 #include <termios.h>
 #include <unistd.h>
 #endif
@@ -85,7 +91,7 @@ std::string read_secret(const std::string& prompt) {
     SetConsoleMode(input, old_mode);
     std::cout << "\n";
     return trim(value);
-#elif defined(__unix__) || defined(__APPLE__)
+#elif CODEX_CHAT_BOT_HAS_TERMIOS
     termios old_term{};
     if (tcgetattr(STDIN_FILENO, &old_term) != 0) {
         std::string value;

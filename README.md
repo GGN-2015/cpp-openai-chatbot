@@ -49,3 +49,14 @@ g++ -std=c++17 -pthread -I. sample.cpp -o sample  # Linux/macOS
 On Windows, `sample.cpp` switches the current console input/output code page to
 UTF-8 while it is running, so Chinese replies display correctly in terminals
 that normally default to GBK.
+
+For Linux ARM/aarch64 cross-compilation, use the target toolchain in the same
+way. No third-party C++ libraries are required:
+
+```sh
+aarch64-linux-gnu-g++ -std=c++17 -pthread -I. sample.cpp -o sample-aarch64
+arm-linux-gnueabihf-g++ -std=c++17 -pthread -I. sample.cpp -o sample-armhf
+```
+
+The target device still needs a working `curl` executable on `PATH` at runtime,
+because the default HTTPS transport launches `curl`.
