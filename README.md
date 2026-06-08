@@ -63,6 +63,8 @@ The cancellation method is thread-safe and non-blocking. It returns `true` when
 a cancel request was accepted, and `false` when there is no active request or
 the configured custom transport does not support cancellation.
 
+## Compilation
+
 Compile with C++17 or newer:
 
 ```sh
